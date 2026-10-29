@@ -22,6 +22,7 @@ class CommandLineTests(unittest.TestCase):
             "tv.local", debug=False, asset_source="auto",
             local_ip_override=None, webos_version_override=None,
             curl_insecure=False, fake_service_path=slopbro.DEFAULT_FAKE_SERVICE_PATH,
+            telnet=False, local_ipk=True,
         )
         self.runners["run_test_connection"].assert_not_called()
         self.runners["run_test_payload"].assert_not_called()
@@ -40,7 +41,16 @@ class CommandLineTests(unittest.TestCase):
                 "tv.local", debug=True, asset_source="dir",
                 local_ip_override="192.168.1.2", webos_version_override="6.5",
                 curl_insecure=True, fake_service_path=slopbro.DEFAULT_FAKE_SERVICE_PATH,
+                telnet=False, local_ipk=True,
             )
+
+    def test_telnet_and_local_ipk_options(self):
+        self.assertEqual(slopbro.main(["--telnet", "tv.local"]), 0)
+        self.assertEqual(self.runners["run"].call_args.kwargs["telnet"], True)
+        self.assertEqual(self.runners["run"].call_args.kwargs["local_ipk"], True)
+
+        self.assertEqual(slopbro.main(["--no-local-ipk", "tv.local"]), 0)
+        self.assertEqual(self.runners["run"].call_args.kwargs["local_ipk"], False)
 
     def test_fake_service_path_options(self):
         for argv, expected in (
@@ -174,6 +184,68 @@ class HandlerTests(unittest.TestCase):
         with patch.object(slopbro, "log") as logger:
             handler.log_message("status %s", 200)
         logger.assert_called_once_with("request from 127.0.0.1: status 200")
+
+    def test_extra_files_served_outside_wwwroot(self):
+        with tempfile.NamedTemporaryFile(delete=False) as fh:
+            fh.write(b"fake ipk contents")
+            ipk_path = fh.name
+        self.addCleanup(os.remove, ipk_path)
+
+        tracked = [slopbro.ENTRY_PAGE, slopbro.HBCHANNEL_IPK_FILENAME]
+        handler_class = slopbro.make_tracking_handler(
+            None, slopbro.RequestedFilesTracker(tracked), tracked,
+            True, False, extra_files={slopbro.HBCHANNEL_IPK_FILENAME: ipk_path},
+        )
+        handler = object.__new__(handler_class)
+        handler.path = "/" + slopbro.HBCHANNEL_IPK_FILENAME
+        with patch.object(handler, "send_response"), \
+             patch.object(handler, "send_header"), \
+             patch.object(handler, "end_headers"):
+            result = handler.send_head()
+        self.assertEqual(result.read(), b"fake ipk contents")
+
+    def test_extra_files_unknown_path_still_404s(self):
+        tracked = [slopbro.ENTRY_PAGE]
+        handler_class = slopbro.make_tracking_handler(
+            None, slopbro.RequestedFilesTracker(tracked), tracked,
+            True, False, extra_files={},
+        )
+        handler = object.__new__(handler_class)
+        handler.path = "/" + slopbro.HBCHANNEL_IPK_FILENAME
+        with patch.object(handler, "send_error") as send_error:
+            self.assertIsNone(handler.send_head())
+        send_error.assert_called_once_with(404, "File not found")
+
+
+class HbchannelIpkCacheTests(unittest.TestCase):
+    def test_fetch_returns_cached_path_without_network(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            dest = os.path.join(cache_dir, slopbro.HBCHANNEL_IPK_FILENAME)
+            with open(dest, "wb") as fh:
+                fh.write(b"already cached")
+            with patch("urllib.request.urlopen") as urlopen:
+                result = slopbro.fetch_hbchannel_ipk_cached(cache_dir=cache_dir)
+            urlopen.assert_not_called()
+            self.assertEqual(result, dest)
+
+    def test_fetch_downloads_when_missing(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            response = Mock()
+            response.read.return_value = b"downloaded bytes"
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            with patch("urllib.request.urlopen", return_value=response) as urlopen:
+                result = slopbro.fetch_hbchannel_ipk_cached(cache_dir=cache_dir)
+            urlopen.assert_called_once()
+            with open(result, "rb") as fh:
+                self.assertEqual(fh.read(), b"downloaded bytes")
+
+    def test_fetch_returns_none_on_network_failure(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            with patch("urllib.request.urlopen", side_effect=OSError("no network")):
+                with patch.object(slopbro, "log"):
+                    result = slopbro.fetch_hbchannel_ipk_cached(cache_dir=cache_dir)
+            self.assertIsNone(result)
 
 
 class Python3CleanupTests(unittest.TestCase):

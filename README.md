@@ -52,7 +52,7 @@ which is executed with root privileges. It is responsible for launching
 Run the script with Python 3, passing the IP address of your TV:
 
 ```bash
-python slopbro.py [--debug] [--curl-insecure] [--fake-service-path <PATH>|--no-fake-service-path] [--local-ip <LOCAL IP>] [--webos-version <VERSION>] [--asset-source <auto|dir|embedded>] [--test-server <simple|payload>] [<TV IP ADDRESS>]
+python slopbro.py [--debug] [--curl-insecure] [--fake-service-path <PATH>|--no-fake-service-path] [--local-ip <LOCAL IP>] [--webos-version <VERSION>] [--asset-source <auto|dir|embedded>] [--telnet] [--local-ipk|--no-local-ipk] [--test-server <simple|payload>] [<TV IP ADDRESS>]
 ```
 
 Use `python3 slopbro.py --help` for the full option reference.
@@ -86,6 +86,18 @@ the selected app fails.*
 
 The `--asset-source` option allows you to specify where the script should look
 for assets (`auto`, `dir`, `embedded`).
+
+The `--telnet` option starts `telnetd` on the TV once rooting completes.
+
+The `--local-ipk` option (enabled by default) pre-fetches the Homebrew
+Channel IPK onto this host (caching it under `~/.cache/slopbro/`) and serves
+it to the TV over the LAN alongside the other payload files, instead of
+having the TV `curl` it directly from GitHub. On some webOS versions that
+direct download hangs or fails TLS verification; staging it locally avoids
+that entirely. If the pre-fetch fails for any reason (no internet access on
+this host, etc.), SlopBro falls back to the original behavior automatically.
+Use `--no-local-ipk` to disable this and always let the TV download it
+itself.
 
 The `--test-server` option starts the local HTTP server and prints its URL
 instead of connecting to the TV over SSAP, so you can test connectivity

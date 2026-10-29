@@ -65,6 +65,17 @@ SERVICE_FILES = [
     "main.js",
 ]
 
+# Kept in sync with the IPK_URL baked into autoroot.sh. On some webOS
+# versions, curl-ing this URL directly from the TV hangs or fails TLS
+# verification; pre-fetching it on the host and serving it over the LAN
+# alongside the other payload files sidesteps that (autoroot.sh already
+# prefers a local hbchannel.ipk next to itself over downloading one).
+HBCHANNEL_IPK_FILENAME = "hbchannel.ipk"
+HBCHANNEL_IPK_URL = (
+    "https://github.com/webosbrew/webos-homebrew-channel/releases/"
+    "download/v0.7.3/org.webosbrew.hbchannel_0.7.3_all.ipk"
+)
+
 ASSET_SOURCE_AUTO = "auto"
 ASSET_SOURCE_DIR = "dir"
 ASSET_SOURCE_EMBEDDED = "embedded"
@@ -580,6 +591,57 @@ def resolve_wwwroot_path():
     return root_dir
 
 
+def fetch_hbchannel_ipk_cached(cache_dir=None, timeout=15.0):
+    """Best-effort pre-fetch of the official Homebrew Channel IPK onto this
+    host, so it can be served to the TV over the LAN alongside the other
+    payload files instead of relying on the TV itself to curl it from
+    GitHub.
+
+    Returns the local file path on success, or None on any failure. The
+    caller should treat None as "proceed as before": autoroot.sh already
+    falls back to downloading the IPK itself when no local copy is staged
+    next to it.
+    """
+    if cache_dir is None:
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "slopbro")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError as exc:
+        log("warning: could not create IPK cache dir %s (%s)" % (cache_dir, exc))
+        return None
+
+    dest = os.path.join(cache_dir, HBCHANNEL_IPK_FILENAME)
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        return dest
+
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(HBCHANNEL_IPK_URL, timeout=timeout) as resp:
+            data = resp.read()
+    except Exception as exc:  # noqa: BLE001 - best-effort, any failure just falls back
+        log(
+            "warning: could not pre-fetch Homebrew Channel IPK (%s); "
+            "the TV will attempt to download it directly instead" % exc
+        )
+        return None
+
+    tmp_dest = dest + ".part"
+    try:
+        with open(tmp_dest, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp_dest, dest)
+    except OSError as exc:
+        log("warning: could not save pre-fetched IPK (%s)" % exc)
+        try:
+            os.remove(tmp_dest)
+        except OSError:
+            pass
+        return None
+
+    return dest
+
+
 def _embedded_meta_for(rel_path):
     if not isinstance(EMBEDDED_WWWROOT, dict):
         return None
@@ -714,8 +776,10 @@ def make_tracking_handler(
     tracked_files,
     allow_embedded_assets,
     allow_filesystem_fallback,
+    extra_files=None,
 ):
     tracked = set(tracked_files)
+    extra_files = extra_files or {}
 
     class TrackingHTTPRequestHandler(SimpleHTTPRequestHandler):
         def _requested_rel_path(self):
@@ -760,6 +824,12 @@ def make_tracking_handler(
                 data = _read_embedded_file(rel_path)
             if data is None and allow_filesystem_fallback:
                 data = _read_filesystem_file(root_dir, rel_path)
+            if data is None and rel_path in extra_files:
+                try:
+                    with open(extra_files[rel_path], "rb") as fh:
+                        data = fh.read()
+                except OSError:
+                    data = None
             if data is None:
                 self.send_error(404, "File not found")
                 return None
@@ -778,6 +848,7 @@ def start_http_server(
     allow_filesystem_fallback,
     bind_host="0.0.0.0",
     preferred_port=8080,
+    extra_files=None,
 ):
     """Start a tiny static file server rooted at root_dir."""
     handler = make_tracking_handler(
@@ -786,6 +857,7 @@ def start_http_server(
         tracked_files,
         allow_embedded_assets,
         allow_filesystem_fallback,
+        extra_files=extra_files,
     )
     return _start_http_server(handler, bind_host, preferred_port)
 
@@ -813,10 +885,11 @@ def build_self_hosted_url(
     local_ip_override=None,
     curl_insecure=False,
     fake_service_path=DEFAULT_FAKE_SERVICE_PATH,
+    service_files=SERVICE_FILES,
 ):
     local_ip = local_ip_override or local_ip_for_remote(tv_host)
     url = "http://%s:%d/%s" % (local_ip, server_port, ENTRY_PAGE)
-    url += "?script=%s&files=%s" % (SHELL_SCRIPT, ";".join(SERVICE_FILES))
+    url += "?script=%s&files=%s" % (SHELL_SCRIPT, ";".join(service_files))
     if debug:
         url += "&debug"
     if curl_insecure:
@@ -1012,6 +1085,8 @@ def run(
     webos_version_override=None,
     curl_insecure=False,
     fake_service_path=DEFAULT_FAKE_SERVICE_PATH,
+    telnet=False,
+    local_ipk=True,
 ):
     secure = True
     port = PORT_TLS if secure else PORT_PLAIN
@@ -1041,11 +1116,29 @@ def run(
     except RuntimeError as exc:
         die("%s" % exc)
 
-    tracker = RequestedFilesTracker(tracked_files)
-    if tracked_files:
+    # Optionally stage the Homebrew Channel IPK on this host so it can be
+    # served to the TV over the LAN, instead of having the TV curl it
+    # directly from GitHub (which can hang or fail TLS verification on some
+    # webOS versions). This is purely additive: on any failure we fall back
+    # to the original behavior unchanged.
+    extra_files = {}
+    service_files_for_tv = list(SERVICE_FILES)
+    if local_ipk:
+        ipk_path = fetch_hbchannel_ipk_cached()
+        if ipk_path:
+            log("serving Homebrew Channel IPK locally from %s" % ipk_path)
+            extra_files[HBCHANNEL_IPK_FILENAME] = ipk_path
+            service_files_for_tv.append(HBCHANNEL_IPK_FILENAME)
+
+    all_tracked_files = tracked_files + [
+        f for f in service_files_for_tv if f not in tracked_files
+    ]
+
+    tracker = RequestedFilesTracker(all_tracked_files)
+    if all_tracked_files:
         log(
             "tracking %d files in %s (source=%s)"
-            % (len(tracked_files), wwwroot_dir, asset_source_used)
+            % (len(all_tracked_files), wwwroot_dir, asset_source_used)
         )
     else:
         log("warning: no files found in %s" % wwwroot_dir)
@@ -1053,9 +1146,10 @@ def run(
         http_server = start_http_server(
             wwwroot_dir,
             tracker,
-            tracked_files,
+            all_tracked_files,
             allow_embedded_assets,
             allow_filesystem_fallback,
+            extra_files=extra_files,
         )
         page_url = build_self_hosted_url(
             host,
@@ -1064,7 +1158,10 @@ def run(
             curl_insecure=curl_insecure,
             local_ip_override=local_ip_override,
             fake_service_path=fake_service_path,
+            service_files=service_files_for_tv,
         )
+        if telnet:
+            page_url += "&telnet"
     except Exception as exc:
         die("could not start self-hosted page server: %s" % exc)
     log("serving files from %s at %s" % (wwwroot_dir, page_url))
@@ -1163,6 +1260,21 @@ def main(argv=None):
         help="disable curl TLS certificate verification for payload downloads",
     )
     parser.add_argument(
+        "--telnet", action="store_true",
+        help="start telnetd on the TV after rooting (passed through to autoroot.sh)",
+    )
+    parser.add_argument(
+        "--local-ipk", action="store_true", default=True,
+        help="pre-fetch the Homebrew Channel IPK on this host and serve it "
+        "to the TV over the LAN instead of having the TV download it "
+        "directly from GitHub (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-local-ipk", dest="local_ipk", action="store_false",
+        help="disable pre-fetching/serving the Homebrew Channel IPK locally; "
+        "let autoroot.sh download it on the TV as before",
+    )
+    parser.add_argument(
         "--fake-service-path", metavar="<path>",
         default=DEFAULT_FAKE_SERVICE_PATH, type=_fake_service_path_arg,
         help="fake service path used to bypass the service launch patch",
@@ -1223,6 +1335,8 @@ def main(argv=None):
             webos_version_override=args.webos_version,
             curl_insecure=args.curl_insecure,
             fake_service_path=args.fake_service_path,
+            telnet=args.telnet,
+            local_ipk=args.local_ipk,
         )
     return 0
 
